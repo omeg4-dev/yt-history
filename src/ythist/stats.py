@@ -328,6 +328,6 @@ def report(con: sqlite3.Connection, console: Console, since: str | None = None, 
     console.print(Text("  watch time = video length × how far the red progress bar got; skipping ahead counts "
                        "as watched, and the bar never shows less than 10%.", style="grey42"))
     console.print(Text(f"  note: YouTube shows no length or progress for Shorts, so the {missing:,} Shorts count as "
-                       "entries but not as watch time (the calendar assumes ~30 s each); "
-                       f"the same goes for {streams:,} streams over 12 h. "
-                       "History only gives the day, not the time of day.", style="grey42"))
+                       "entries but not as watch time (the calendar assumes ~30 s each)"
+                       + (f"; the same goes for {streams:,} streams over 12 h. " if streams else ". ")
+                       + "History only gives the day, not the time of day.", style="grey42"))

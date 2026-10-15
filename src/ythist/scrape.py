@@ -131,9 +131,9 @@ def render(s: State, width: int = 160) -> Layout:
     row("rate", f"{rate:,.1f} /s")
     row("elapsed", dur(_elapsed(s)))
     if s.heap:
-        row("browser heap", f"{s.heap / 1e6:,.0f} MB  (peak {s.heap_peak / 1e6:,.0f})", "grey70")
+        row("browser heap", f"{s.heap / 1e6:,.0f} MB ↑{s.heap_peak / 1e6:,.0f}", "grey70")
         row("dom nodes", f"{s.nodes:,}", "grey70")
-        row("page recycles", f"{s.recycles}", "grey70")
+        row("recycles", f"{s.recycles}", "grey70")
     tiles.add_row("", "")
     row("scrolling past", s.label, "bold yellow3")
     row("date", s.day or "–")

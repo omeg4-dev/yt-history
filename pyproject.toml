@@ -1,7 +1,7 @@
 [project]
 name = "ythist"
 version = "0.1.0"
-description = "Add your description here"
+description = "Scrape your YouTube watch history, store it in SQLite and get a terminal stats report"
 readme = "README.md"
 authors = [
     { name = "Omega", email = "96435033+omeg4-dev@users.noreply.github.com" }
