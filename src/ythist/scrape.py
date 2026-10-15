@@ -10,7 +10,7 @@ from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import date
 
-from playwright.sync_api import Page, Response, sync_playwright
+from playwright.sync_api import Page, Response, Route, sync_playwright
 from rich.align import Align
 from rich.console import Console, Group
 from rich.layout import Layout
@@ -30,13 +30,24 @@ LOGIN_URL = ("https://accounts.google.com/ServiceLogin?service=youtube"
              "&continue=https%3A%2F%2Fwww.youtube.com%2Ffeed%2Fhistory")
 ACCENT = "#ff3d3d"
 
-# Keep the DOM small on long histories: drop rendered day sections far above the viewport.
+# Long histories: YouTube keeps every loaded day both in the DOM and in its data model
+# (ytInitialData grows ~15 KB per entry). Drop old rendered sections and empty the old
+# sections' contents in place — same array length, so YouTube's own indices stay valid.
 PRUNE_JS = """(keep) => {
   const secs = document.querySelectorAll('ytd-section-list-renderer #contents > ytd-item-section-renderer');
-  let n = 0;
-  for (let i = 0; i < secs.length - keep; i++) { secs[i].remove(); n++; }
-  return n;
+  for (let i = 0; i < secs.length - keep; i++) secs[i].remove();
+  const sl = document.querySelector('ytd-section-list-renderer');
+  const items = sl && sl.data && sl.data.contents;
+  if (items) for (let i = 0; i < items.length - keep - 1; i++) {
+    const sec = items[i] && items[i].itemSectionRenderer;
+    if (sec && sec.contents && sec.contents.length) sec.contents = [];
+  }
 }"""
+HEALTH_JS = """() => ({heap: performance.memory ? performance.memory.usedJSHeapSize : 0,
+                     nodes: document.getElementsByTagName('*').length})"""
+# Thumbnails, avatars, hover previews and web fonts: nothing we read, lots of RAM.
+BLOCKED_URLS = ["*://i.ytimg.com/*", "*://i9.ytimg.com/*", "*://*.ggpht.com/*",
+                "*://yt3.googleusercontent.com/*", "*://*.googlevideo.com/*", "*://fonts.gstatic.com/*"]
 REMAINING_JS = """() => {
   const el = document.scrollingElement;
   return el.scrollHeight - (el.scrollTop + window.innerHeight);
@@ -56,6 +67,10 @@ class State:
     shorts: int = 0
     new: int = 0
     watched_s: int = 0
+    heap: int = 0
+    heap_peak: int = 0
+    recycles: int = 0
+    nodes: int = 0
     runtime_s: int = 0
     label: str = "–"
     day: str | None = None
@@ -115,6 +130,10 @@ def render(s: State, width: int = 160) -> Layout:
     row("pages", f"{s.pages}")
     row("rate", f"{rate:,.1f} /s")
     row("elapsed", dur(_elapsed(s)))
+    if s.heap:
+        row("browser heap", f"{s.heap / 1e6:,.0f} MB  (peak {s.heap_peak / 1e6:,.0f})", "grey70")
+        row("dom nodes", f"{s.nodes:,}", "grey70")
+        row("page recycles", f"{s.recycles}", "grey70")
     tiles.add_row("", "")
     row("scrolling past", s.label, "bold yellow3")
     row("date", s.day or "–")
@@ -181,6 +200,13 @@ def render(s: State, width: int = 160) -> Layout:
     return layout
 
 
+def _log(run_id: int, msg: str) -> None:
+    d = RAW_DIR / f"run-{run_id:04d}"
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / "scrape.log", "a") as f:
+        f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+
+
 def _save_raw(run_id: int, n: int, data: dict) -> None:
     d = RAW_DIR / f"run-{run_id:04d}"
     d.mkdir(parents=True, exist_ok=True)
@@ -194,7 +220,7 @@ def _wait_for_login(page: Page, s: State, live: Live) -> None:
     s.phase, s.note = "waiting", "log into YouTube in the browser window (one time only)"
     page.goto(LOGIN_URL)
     while True:
-        live.update(render(s, console.width))
+        live.update(render(s, live.console.width))
         page.wait_for_timeout(1500)
         try:
             if "youtube.com" in page.url and browser.logged_in(page):
@@ -203,8 +229,8 @@ def _wait_for_login(page: Page, s: State, live: Live) -> None:
             pass
 
 
-def scrape(console: Console, *, tick_ms: int = 180, keep_open: bool = False,
-           max_pages: int | None = None, stall_s: float = 45) -> int:
+def scrape(console: Console, *, tick_ms: int = 180, keep_open: bool = False, images: bool = False,
+           max_pages: int | None = None, stall_s: float = 45, heap_limit_mb: int = 1200) -> int:
     con = db.connect()
     run_id = db.start_run(con)
     s = State()
@@ -236,9 +262,14 @@ def scrape(console: Console, *, tick_ms: int = 180, keep_open: bool = False,
     status = "error"
     position = 0
     last_label: str | None = None
+    next_token: str | None = None
+    resume: dict = {"token": None}  # set while a recycled page waits for its first continuation
+    recycled_at = -1                # page count at the last recycle; one recycle per ingested page
 
     def ingest(data: dict) -> bool:
-        nonlocal position, last_label
+        nonlocal position, last_label, next_token
+        if nxt := first(data, "continuationCommand"):
+            next_token = nxt.get("token")
         entries, more = parse_page(data, last_label=last_label)
         for e in entries:
             e.position = position
@@ -246,10 +277,43 @@ def scrape(console: Console, *, tick_ms: int = 180, keep_open: bool = False,
         if entries:
             last_label = entries[-1].date_label
         s.pages += 1
+        _log(run_id, f"page {s.pages}: {len(entries)} entries, more={more}")
         _save_raw(run_id, s.pages, data)
         s.new += db.upsert(con, run_id, entries)
         s.add(entries)
         return more
+
+    def swap_token(route: Route) -> None:
+        """On a recycled page, point YouTube's first "load more" at where we left off.
+
+        The browser still builds and authenticates the request itself; only the
+        continuation token in its (gzipped) JSON body is replaced.
+        """
+        token = resume["token"]
+        body = route.request.post_data_buffer or b""
+        zipped = body[:2] == b"\x1f\x8b"
+        try:
+            payload = json.loads(gzip.decompress(body) if zipped else body)
+        except ValueError:
+            return route.continue_()
+        if not token or "continuation" not in payload:
+            return route.continue_()
+        resume["token"] = None
+        _log(run_id, f"swap: resuming at token …{token[-16:]}")
+        payload["continuation"] = token
+        raw = json.dumps(payload).encode()
+        route.continue_(post_data=gzip.compress(raw) if zipped else raw)
+
+    def recycle(page: Page) -> None:
+        """Reload the feed for a fresh JS heap, then resume from the saved token."""
+        s.recycles += 1
+        _log(run_id, f"recycle #{s.recycles} at page {s.pages}, heap {s.heap / 1e6:.0f} MB")
+        s.note = f"recycling page (heap {s.heap / 1e6:,.0f} MB)"
+        resume["token"] = next_token
+        page.goto(HISTORY_URL, wait_until="domcontentloaded")
+        page.wait_for_function("() => window.ytInitialData && window.ytInitialData.contents")
+        s.heap = page.evaluate(HEALTH_JS)["heap"]
+        _log(run_id, f"recycle done, heap {s.heap / 1e6:.0f} MB")
 
     with sync_playwright() as pw, Live(render(s), console=console, screen=True,
                                        refresh_per_second=12, transient=False) as live:
@@ -261,6 +325,11 @@ def scrape(console: Console, *, tick_ms: int = 180, keep_open: bool = False,
             s.phase, s.note = "loading", "opening history"
             live.update(render(s, console.width))
             page.on("response", on_response)
+            cdp = page.context.new_cdp_session(page)
+            if not images:
+                cdp.send("Network.enable")
+                cdp.send("Network.setBlockedURLs", {"urls": BLOCKED_URLS})
+            page.route("**/youtubei/v1/browse*", swap_token)
             page.goto(HISTORY_URL, wait_until="domcontentloaded")
             page.wait_for_function("() => window.ytInitialData && window.ytInitialData.contents")
             more = ingest(page.evaluate("() => window.ytInitialData"))
@@ -275,10 +344,21 @@ def scrape(console: Console, *, tick_ms: int = 180, keep_open: bool = False,
                 while pending:
                     more = ingest(pending.popleft())
                     last_data = time.monotonic()
-                    if s.pages % 4 == 0:
-                        page.evaluate(PRUNE_JS, 4)
+                    page.evaluate(PRUNE_JS, 4)
+                    h = page.evaluate(HEALTH_JS)
+                    s.heap, s.nodes = h["heap"], h["nodes"]
+                    s.heap_peak = max(s.heap_peak, s.heap)
                 if not more or (max_pages and s.pages >= max_pages):
                     break
+                if (s.heap > heap_limit_mb * 1e6 and next_token and s.pages > recycled_at
+                        and not resume["token"]):
+                    # The raw number includes garbage; only recycle if it survives a full GC.
+                    cdp.send("HeapProfiler.collectGarbage")
+                    s.heap = page.evaluate(HEALTH_JS)["heap"]
+                    if s.heap > heap_limit_mb * 1e6:
+                        recycle(page)
+                        recycled_at = s.pages
+                        last_data = time.monotonic()
                 page.evaluate(UNFOCUS_JS)
                 page.keyboard.press("PageDown")
                 remaining = page.evaluate(REMAINING_JS)
@@ -312,8 +392,13 @@ def scrape(console: Console, *, tick_ms: int = 180, keep_open: bool = False,
             live.update(render(s, console.width))
         finally:
             db.finish_run(con, run_id, s.videos + s.shorts, s.new, status)
+            _log(run_id, f"end: {status}, {s.pages} pages, {s.recycles} recycles, "
+                         f"peak heap {s.heap_peak / 1e6:.0f} MB")
             if proc and not keep_open:
-                proc.terminate()
+                try:  # brave-origin is a shell wrapper; ask the browser itself to quit
+                    b.new_browser_cdp_session().send("Browser.close")
+                except Exception:
+                    proc.terminate()
 
     console.print(render_summary(s, status, errors))
     return run_id

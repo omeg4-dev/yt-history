@@ -73,7 +73,7 @@ def overview(rows: list[dict]) -> Panel:
         tile(f"{len({r['video_id'] for r in rows}):,}", "unique videos"),
         tile(f"{len(channels):,}", "channels"),
         tile(f"{shorts:,}", "shorts", "bold magenta"),
-        tile(dur(watched, short=True), "actually watched", "bold green3"),
+        tile(dur(watched, short=True), "watched (progress)", "bold green3"),
         tile(dur(runtime, short=True), "runtime clicked on"),
         tile(f"{watched / runtime:.0%}" if runtime else "–", "watched of runtime", "bold yellow3"),
         tile(dur(watched / active if active else 0, short=True), "per active day"),
@@ -256,15 +256,15 @@ def highlights(rows: list[dict], top: int) -> Panel:
     for r in rows:
         by_day[r["watch_date"]] += r["watched_s"] or 0
         n_day[r["watch_date"]] += 1
-    if by_day:
-        d, t = by_day.most_common(1)[0]
-        facts.append(("biggest day", f"{date.fromisoformat(d):%a %d %b %Y} — {dur(t)} across {n_day[d]} videos"))
+    if n_day:
+        d, n = n_day.most_common(1)[0]
+        facts.append(("busiest day", f"{n} videos on {date.fromisoformat(d):%a %d %b %Y}"))
     sh = Counter(r["watch_date"] for r in rows if r["is_short"])
     if sh:
         d, c = sh.most_common(1)[0]
         facts.append(("shorts binge", f"{c} shorts on {date.fromisoformat(d):%a %d %b %Y}"))
 
-    finished = [r for r in vids if (r["percent"] or 0) >= 90 and r["duration_s"]]
+    finished = [r for r in vids if (r["percent"] or 0) >= 90 and r["watched_s"]]
     if finished:
         r = max(finished, key=lambda r: r["duration_s"])
         facts.append(("longest finished", f"{clock(r['duration_s'])}  {r['title']}  [cyan]({r['channel_name']})"))
@@ -299,10 +299,10 @@ def highlights(rows: list[dict], top: int) -> Panel:
     re = [(vid, n) for vid, n in seen.most_common() if n > 1]
     if re:
         title = next(r["title"] for r in rows if r["video_id"] == re[0][0])
-        facts.append(("rewatched", f"{len(re):,} videos on more than one day — top: {title} ({re[0][1]} days)"))
+        facts.append(("rewatched", f"{len(re):,} videos on more than one day — top: {title[:70]} ({re[0][1]} days)"))
 
     t = Table.grid(padding=(0, 2))
-    t.add_column(style=f"bold {ACCENT}", justify="right", no_wrap=True)
+    t.add_column(style=f"bold {ACCENT}", justify="right", no_wrap=True, min_width=19)
     t.add_column(overflow="ellipsis", no_wrap=True)
     for k, v in facts:
         t.add_row(k, v)
@@ -324,6 +324,10 @@ def report(con: sqlite3.Connection, console: Console, since: str | None = None, 
     console.print(popularity(rows, top))
     console.print(highlights(rows, top))
     missing = sum(1 for r in rows if r["is_short"])
+    streams = sum(1 for r in rows if (r["duration_s"] or 0) > 43200)
+    console.print(Text("  watch time = video length × how far the red progress bar got; skipping ahead counts "
+                       "as watched, and the bar never shows less than 10%.", style="grey42"))
     console.print(Text(f"  note: YouTube shows no length or progress for Shorts, so the {missing:,} Shorts count as "
-                       "entries but not as watch time (the calendar assumes ~30 s each). "
+                       "entries but not as watch time (the calendar assumes ~30 s each); "
+                       f"the same goes for {streams:,} streams over 12 h. "
                        "History only gives the day, not the time of day.", style="grey42"))

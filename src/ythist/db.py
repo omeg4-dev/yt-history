@@ -42,8 +42,10 @@ CREATE TABLE IF NOT EXISTS runs (
     status      TEXT DEFAULT 'running'
 );
 CREATE INDEX IF NOT EXISTS entries_date ON entries(watch_date);
-CREATE VIEW IF NOT EXISTS history AS
-    SELECT e.watch_date, e.date_label, e.position, e.percent, e.watched_s,
+DROP VIEW IF EXISTS history;
+CREATE VIEW history AS
+    SELECT e.watch_date, e.date_label, e.position, e.percent,
+           CASE WHEN v.duration_s > 43200 THEN NULL ELSE e.watched_s END AS watched_s,
            v.video_id, v.title, v.channel_name, v.channel_handle, v.channel_id,
            v.duration_s, v.views, v.is_short,
            'https://www.youtube.com/watch?v=' || v.video_id AS url

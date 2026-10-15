@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 
+# Longer than this is a 24/7 stream or a stream archive watched live: its "duration"
+# and progress say nothing about how long you watched, so it gets no watch time.
+MAX_TIMED_S = 12 * 3600
+
+
 @dataclass
 class Entry:
     video_id: str
@@ -24,7 +29,7 @@ class Entry:
 
     @property
     def watched_s(self) -> int | None:
-        if self.duration_s is None:
+        if self.duration_s is None or self.duration_s > MAX_TIMED_S:
             return None
         if self.percent is None:
             # No progress bar: Shorts loop and never get one -> count as fully watched.

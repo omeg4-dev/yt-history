@@ -1,3 +1,4 @@
+import gzip
 import json
 from datetime import date
 from pathlib import Path
@@ -89,13 +90,13 @@ def test_carries_date_into_headerless_section():
     assert entries[0].watch_date == "2026-10-14"
 
 
-RAW = Path.home() / ".local/share/ythist/raw/probe"
+RAW = sorted((Path.home() / ".local/share/ythist/raw").glob("run-*/page-*.json.gz"))[:20]
 
 
-@pytest.mark.skipif(not RAW.exists(), reason="no captured pages on this machine")
+@pytest.mark.skipif(not RAW, reason="no captured pages on this machine")
 def test_real_captures_parse_cleanly():
-    for f in sorted(RAW.glob("*.json")):
-        data = json.loads(f.read_text())
+    for f in RAW:
+        data = json.loads(gzip.decompress(f.read_bytes()))
         entries, _ = parse_page(data, TODAY)
         assert entries, f
         videos = [e for e in entries if not e.is_short]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import signal
 import sys
 from pathlib import Path
 
@@ -18,7 +19,7 @@ def cmd_scrape(a: argparse.Namespace, console: Console) -> None:
     from .enrich import enrich
     from .scrape import scrape
 
-    scrape(console, tick_ms=a.delay, keep_open=a.keep_open, max_pages=a.max_pages)
+    scrape(console, tick_ms=a.delay, images=a.images, heap_limit_mb=a.heap_limit, keep_open=a.keep_open, max_pages=a.max_pages)
     if not a.no_enrich:
         enrich(db.connect(), console)
     if not a.no_stats:
@@ -50,13 +51,21 @@ def cmd_export(a: argparse.Namespace, console: Console) -> None:
     console.print(f"[green3]✓[/] {len(rows):,} rows → {out}")
 
 
+def _sigterm(*_: object) -> None:
+    raise KeyboardInterrupt  # same clean path as Ctrl-C: run marked, browser closed
+
+
 def main(argv: list[str] | None = None) -> None:
+    signal.signal(signal.SIGTERM, _sigterm)
     p = argparse.ArgumentParser(prog="ythist", description=__doc__)
     sub = p.add_subparsers(dest="cmd")
 
     s = sub.add_parser("scrape", help="scroll your history in Brave and store everything (default)")
     s.add_argument("--delay", type=int, default=180, help="ms between PageDown presses (default 180)")
     s.add_argument("--max-pages", type=int, help="stop after N feed pages (≈200 entries each)")
+    s.add_argument("--images", action="store_true", help="load thumbnails (prettier, much more RAM)")
+    s.add_argument("--heap-limit", type=int, default=1200, metavar="MB",
+                   help="reload the page and resume when the tab's JS heap passes this (default 1200)")
     s.add_argument("--keep-open", action="store_true", help="leave the browser running afterwards")
     s.add_argument("--no-enrich", action="store_true", help="skip filling Shorts channels via oEmbed")
     s.add_argument("--no-stats", action="store_true", help="don't print the report afterwards")
@@ -81,4 +90,8 @@ def main(argv: list[str] | None = None) -> None:
     a = p.parse_args(argv)
     console = Console()
     console.print(f"[grey50]database: {DB_PATH}")
-    a.fn(a, console)
+    try:
+        a.fn(a, console)
+    except KeyboardInterrupt:
+        console.print("[yellow3]interrupted — everything scraped so far is saved")
+        sys.exit(130)

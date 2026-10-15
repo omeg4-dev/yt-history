@@ -45,3 +45,9 @@ def test_watched_seconds():
     assert e.watched_s == 300
     assert Entry("x", "t", "d", "l", duration_s=600).watched_s is None
     assert Entry("x", "t", "d", "l", duration_s=40, is_short=True).watched_s == 40
+
+
+def test_endless_streams_get_no_watch_time():
+    # a 24/7 stream reports a 966 h "duration" at 100 %
+    assert Entry("x", "t", "d", "l", duration_s=966 * 3600, percent=100).watched_s is None
+    assert Entry("x", "t", "d", "l", duration_s=12 * 3600, percent=50).watched_s == 6 * 3600
